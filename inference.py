@@ -18,6 +18,7 @@ from pathlib import Path
 
 import torch
 import torchaudio
+import wandb
 
 from flowclean.config import FlowCleanConfig
 from flowclean.models import FlowCleanUNet
@@ -160,7 +161,6 @@ def evaluate_metrics(enhanced_dir: str, test_ds: VoiceBankDEMAND, sample_rate: i
         print(f"  STOI:  {avg_stoi:.4f}")
 
         if cfg.wandb.use_wandb:
-            import wandb
             wandb.log({"eval/pesq": avg_pesq, "eval/stoi": avg_stoi})
     else:
         print("No files to evaluate.")
@@ -181,9 +181,6 @@ def main():
 
     # Wandb (optional)
     if cfg.wandb.use_wandb:
-        import wandb
-        if cfg.wandb.wandb_token:
-            wandb.login(key=cfg.wandb.wandb_token)
         wandb.init(
             project=cfg.wandb.project,
             job_type="inference",
@@ -236,7 +233,6 @@ def main():
         evaluate_metrics(str(output_dir), test_ds, cfg.data.sample_rate, cfg)
 
     if cfg.wandb.use_wandb:
-        import wandb
         wandb.finish()
 
 

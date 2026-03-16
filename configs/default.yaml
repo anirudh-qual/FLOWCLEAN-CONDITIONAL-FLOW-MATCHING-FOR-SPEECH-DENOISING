@@ -55,4 +55,4 @@ inference:
 wandb:
   use_wandb: false
   project: "flowclean"
-  wandb_token: null                     # your wandb API key (or set WANDB_API_KEY env var)
+  

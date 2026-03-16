@@ -17,10 +17,12 @@ import random
 import time
 from pathlib import Path
 
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+import wandb
 
 from flowclean.config import FlowCleanConfig
 from flowclean.models import FlowCleanUNet
@@ -124,7 +126,6 @@ def train_one_epoch(
                 f"lr={lr:.2e}"
             )
             if cfg.wandb.use_wandb:
-                import wandb
                 wandb.log({
                     "train/loss": loss.item(),
                     "train/loss_fm": loss_fm.item(),
@@ -148,9 +149,6 @@ def main():
 
     # Wandb (optional)
     if cfg.wandb.use_wandb:
-        import wandb
-        if cfg.wandb.wandb_token:
-            wandb.login(key=cfg.wandb.wandb_token)
         wandb.init(
             project=cfg.wandb.project,
             config={
@@ -228,7 +226,6 @@ def main():
         print(f"Epoch {epoch+1}/{cfg.training.epochs} — avg_loss={avg_loss:.4f} — {elapsed:.1f}s")
 
         if cfg.wandb.use_wandb:
-            import wandb
             wandb.log({"epoch/avg_loss": avg_loss, "epoch": epoch + 1}, step=global_step)
 
         # Save checkpoint
@@ -258,7 +255,6 @@ def main():
                 print(f"  -> New best model saved (loss={best_loss:.4f})")
 
     if cfg.wandb.use_wandb:
-        import wandb
         wandb.finish()
 
     print("Training complete!")
