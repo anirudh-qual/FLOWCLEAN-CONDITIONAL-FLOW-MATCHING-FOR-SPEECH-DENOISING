@@ -8,20 +8,18 @@ Optionally computes PESQ, STOI, and DNSMOS metrics on the test set.
 
 Usage:
     python inference.py --checkpoint checkpoints/flowclean_best.pt \
-                        --data_root ./data/voicebank_demand \
                         --output_dir ./enhanced \
                         --ode_steps 10 \
                         --solver euler
 """
 
 import argparse
-import os
 from pathlib import Path
 
 import torch
 import torchaudio
-import yaml
 
+from flowclean.config import FlowCleanConfig
 from flowclean.models import FlowCleanUNet
 from flowclean.data import VoiceBankDEMAND
 from flowclean.utils.stft import stft, istft
@@ -84,7 +82,7 @@ def heun_solve(
 def enhance_waveform(
     model: FlowCleanUNet,
     noisy_wav: torch.Tensor,
-    stft_cfg: dict,
+    cfg: FlowCleanConfig,
     K: int = 10,
     solver: str = "euler",
     device: torch.device = torch.device("cpu"),
@@ -94,7 +92,7 @@ def enhance_waveform(
     Args:
         model: trained FlowClean model.
         noisy_wav: (T,) mono waveform.
-        stft_cfg: STFT parameters dict.
+        cfg: FlowCleanConfig with STFT parameters.
         K: number of ODE steps.
         solver: "euler" or "heun".
 
@@ -104,9 +102,10 @@ def enhance_waveform(
     model.eval()
     orig_len = noisy_wav.shape[-1]
     noisy_wav = noisy_wav.unsqueeze(0).to(device)  # (1, T)
+    stft_kwargs = cfg.stft.to_dict()
 
     # Step 1: Compute noisy spectrogram
-    X = stft(noisy_wav, **stft_cfg)  # (1, 2, F, T')
+    X = stft(noisy_wav, **stft_kwargs)  # (1, 2, F, T')
 
     # Step 2: Initialize from Gaussian
     z0 = torch.randn_like(X)
@@ -116,12 +115,12 @@ def enhance_waveform(
     Y_hat = solve_fn(model, X, z0, K)
 
     # Step 4: Inverse STFT
-    enhanced = istft(Y_hat, **stft_cfg, length=orig_len)
+    enhanced = istft(Y_hat, **stft_kwargs, length=orig_len)
     return enhanced.squeeze(0)  # (T,)
 
 
-def evaluate_metrics(enhanced_dir: str, clean_dir: str):
-    """Compute PESQ and STOI on enhanced files. Requires pesq and pystoi packages."""
+def evaluate_metrics(enhanced_dir: str, test_ds: VoiceBankDEMAND, sample_rate: int):
+    """Compute PESQ and STOI on enhanced files using clean refs from HF dataset."""
     try:
         from pesq import pesq
         from pystoi import stoi
@@ -130,27 +129,27 @@ def evaluate_metrics(enhanced_dir: str, clean_dir: str):
         return
 
     enhanced_dir = Path(enhanced_dir)
-    clean_dir = Path(clean_dir)
 
     pesq_scores = []
     stoi_scores = []
 
-    for f in sorted(enhanced_dir.glob("*.wav")):
-        clean_path = clean_dir / f.name
-        if not clean_path.exists():
+    for i in range(len(test_ds)):
+        fname = test_ds.filenames[i]
+        enh_path = enhanced_dir / fname
+        if not enh_path.exists():
             continue
 
-        enh, sr = torchaudio.load(str(f))
-        cln, _ = torchaudio.load(str(clean_path))
+        enh, sr = torchaudio.load(str(enh_path))
         enh = enh[0].numpy()
-        cln = cln[0].numpy()
+
+        cln = test_ds[i]["clean"].numpy()
 
         min_len = min(len(enh), len(cln))
         enh = enh[:min_len]
         cln = cln[:min_len]
 
-        pesq_scores.append(pesq(sr, cln, enh, "wb"))
-        stoi_scores.append(stoi(cln, enh, sr, extended=False))
+        pesq_scores.append(pesq(sample_rate, cln, enh, "wb"))
+        stoi_scores.append(stoi(cln, enh, sample_rate, extended=False))
 
     n = len(pesq_scores)
     if n > 0:
@@ -164,7 +163,7 @@ def evaluate_metrics(enhanced_dir: str, clean_dir: str):
 def main():
     parser = argparse.ArgumentParser(description="FlowClean Inference")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint")
-    parser.add_argument("--data_root", type=str, default="./data/voicebank_demand")
+    parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--output_dir", type=str, default="./enhanced")
     parser.add_argument("--ode_steps", type=int, default=10, help="Number of ODE steps K")
     parser.add_argument("--solver", type=str, default="euler", choices=["euler", "heun"])
@@ -172,33 +171,26 @@ def main():
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cfg = FlowCleanConfig.from_yaml(args.config)
 
     # Load checkpoint
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    cfg = ckpt["config"]
 
     # Build model
     model = FlowCleanUNet(
-        base_channels=cfg["model"]["base_channels"],
-        num_levels=cfg["model"]["num_levels"],
-        time_dim=cfg["model"]["time_dim"],
+        base_channels=cfg.model.base_channels,
+        num_levels=cfg.model.num_levels,
+        time_dim=cfg.model.time_dim,
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     print(f"Loaded checkpoint from epoch {ckpt.get('epoch', '?')}")
 
-    stft_cfg = {
-        "n_fft": cfg["stft"]["n_fft"],
-        "hop_length": cfg["stft"]["hop_length"],
-        "win_length": cfg["stft"]["win_length"],
-    }
-
-    # Load test set
+    # Load test set (from HuggingFace: JacobLinCool/VoiceBank-DEMAND-16k)
     test_ds = VoiceBankDEMAND(
-        root=args.data_root,
         split="test",
         segment_length=None,  # full utterance
-        sample_rate=cfg["data"]["sample_rate"],
+        sample_rate=cfg.data.sample_rate,
     )
 
     output_dir = Path(args.output_dir)
@@ -209,14 +201,14 @@ def main():
         sample = test_ds[i]
         noisy = sample["noisy"]
         enhanced = enhance_waveform(
-            model, noisy, stft_cfg,
+            model, noisy, cfg,
             K=args.ode_steps,
             solver=args.solver,
             device=device,
         )
         fname = test_ds.filenames[i]
         out_path = output_dir / fname
-        torchaudio.save(str(out_path), enhanced.unsqueeze(0).cpu(), cfg["data"]["sample_rate"])
+        torchaudio.save(str(out_path), enhanced.unsqueeze(0).cpu(), cfg.data.sample_rate)
 
         if (i + 1) % 50 == 0:
             print(f"  Processed {i+1}/{len(test_ds)}")
@@ -225,8 +217,7 @@ def main():
 
     # Evaluate metrics
     if args.eval_metrics:
-        clean_test_dir = Path(args.data_root) / "clean_testset_wav"
-        evaluate_metrics(str(output_dir), str(clean_test_dir))
+        evaluate_metrics(str(output_dir), test_ds, cfg.data.sample_rate)
 
 
 if __name__ == "__main__":

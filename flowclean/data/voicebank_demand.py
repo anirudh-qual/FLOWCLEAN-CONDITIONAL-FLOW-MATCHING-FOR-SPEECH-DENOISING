@@ -1,29 +1,20 @@
 """VoiceBank-DEMAND dataset for FlowClean.
 
-Expects the standard directory layout:
-    data_root/
-        clean_trainset_28spk_wav/   (or clean_trainset_wav/)
-        noisy_trainset_28spk_wav/   (or noisy_trainset_wav/)
-        clean_testset_wav/
-        noisy_testset_wav/
-
-All files are expected at 16 kHz mono.
+Loads JacobLinCool/VoiceBank-DEMAND-16k from HuggingFace.
 """
 
-import os
 import random
-from pathlib import Path
 
 import torch
 import torchaudio
 from torch.utils.data import Dataset
+from datasets import load_dataset
 
 
 class VoiceBankDEMAND(Dataset):
-    """Paired noisy/clean speech dataset.
+    """Paired noisy/clean speech dataset from HuggingFace.
 
     Args:
-        root: path to VoiceBank-DEMAND root.
         split: "train" or "test".
         segment_length: fixed waveform length in samples (default ~2s at 16kHz).
             None = return full utterance (for evaluation).
@@ -32,72 +23,43 @@ class VoiceBankDEMAND(Dataset):
 
     def __init__(
         self,
-        root: str,
         split: str = "train",
         segment_length: int | None = 32000,
         sample_rate: int = 16000,
     ):
         super().__init__()
-        self.root = Path(root)
         self.split = split
         self.segment_length = segment_length
         self.sample_rate = sample_rate
 
-        if split == "train":
-            clean_dir_candidates = [
-                "clean_trainset_28spk_wav",
-                "clean_trainset_wav",
-            ]
-            noisy_dir_candidates = [
-                "noisy_trainset_28spk_wav",
-                "noisy_trainset_wav",
-            ]
-        else:
-            clean_dir_candidates = ["clean_testset_wav"]
-            noisy_dir_candidates = ["noisy_testset_wav"]
-
-        self.clean_dir = self._find_dir(clean_dir_candidates)
-        self.noisy_dir = self._find_dir(noisy_dir_candidates)
-
-        # Collect paired filenames
-        clean_files = set(os.listdir(self.clean_dir))
-        noisy_files = set(os.listdir(self.noisy_dir))
-        common = sorted(clean_files & noisy_files)
-        self.filenames = [f for f in common if f.endswith(".wav")]
-
-        if len(self.filenames) == 0:
-            raise RuntimeError(
-                f"No paired .wav files found in {self.clean_dir} and {self.noisy_dir}"
-            )
-
-    def _find_dir(self, candidates: list[str]) -> Path:
-        for name in candidates:
-            d = self.root / name
-            if d.is_dir():
-                return d
-        raise FileNotFoundError(
-            f"None of {candidates} found under {self.root}"
+        self.hf_dataset = load_dataset(
+            "JacobLinCool/VoiceBank-DEMAND-16k",
+            split=split,
         )
+        # Build filenames list from the 'id' column for compatibility
+        # Use column access (fast) instead of row iteration (decodes audio)
+        self.filenames = [uid + ".wav" for uid in self.hf_dataset["id"]]
 
     def __len__(self) -> int:
-        return len(self.filenames)
+        return len(self.hf_dataset)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        fname = self.filenames[idx]
-        clean, sr = torchaudio.load(str(self.clean_dir / fname))
-        noisy, _ = torchaudio.load(str(self.noisy_dir / fname))
+        row = self.hf_dataset[idx]
 
-        # Resample if needed
+        # HF audio columns decode to {"array": np.ndarray, "sampling_rate": int}
+        clean_audio = row["clean"]
+        noisy_audio = row["noisy"]
+
+        clean = torch.from_numpy(clean_audio["array"]).float()
+        noisy = torch.from_numpy(noisy_audio["array"]).float()
+
+        # Resample if needed (dataset is already 16kHz, but just in case)
+        sr = clean_audio["sampling_rate"]
         if sr != self.sample_rate:
             resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
             clean = resampler(clean)
             noisy = resampler(noisy)
 
-        # Mono
-        clean = clean[0]  # (T,)
-        noisy = noisy[0]
-
-        # Random crop or pad
         if self.segment_length is not None:
             clean, noisy = self._fix_length(clean, noisy, self.segment_length)
 

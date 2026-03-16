@@ -2,7 +2,6 @@
 
 # --------------- Data ---------------
 data:
-  root: "./data/voicebank_demand"       # Path to VoiceBank-DEMAND dataset
   sample_rate: 16000
   segment_length: 32000                 # ~2 seconds at 16 kHz
 
