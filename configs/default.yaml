@@ -50,3 +50,9 @@ training:
 inference:
   ode_steps: 10                         # K in {1, 2, 5, 10, 20}
   solver: "euler"                       # "euler" or "heun"
+
+# --------------- Wandb (optional) ---------------
+wandb:
+  use_wandb: false
+  project: "flowclean"
+  wandb_token: null                     # your wandb API key (or set WANDB_API_KEY env var)

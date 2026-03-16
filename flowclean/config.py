@@ -70,6 +70,13 @@ class InferenceConfig:
 
 
 @dataclass
+class WandbConfig:
+    use_wandb: bool = False
+    project: str = "flowclean"
+    wandb_token: str | None = None
+
+
+@dataclass
 class FlowCleanConfig:
     data: DataConfig = field(default_factory=DataConfig)
     stft: STFTConfig = field(default_factory=STFTConfig)
@@ -77,6 +84,7 @@ class FlowCleanConfig:
     loss: LossConfig = field(default_factory=LossConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
 
     @staticmethod
     def from_yaml(path: str) -> "FlowCleanConfig":
@@ -105,4 +113,6 @@ class FlowCleanConfig:
             cfg.training = TrainingConfig(**train_raw)
         if "inference" in raw:
             cfg.inference = InferenceConfig(**raw["inference"])
+        if "wandb" in raw:
+            cfg.wandb = WandbConfig(**raw["wandb"])
         return cfg

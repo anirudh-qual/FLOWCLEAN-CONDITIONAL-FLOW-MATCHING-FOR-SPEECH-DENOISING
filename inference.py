@@ -119,7 +119,7 @@ def enhance_waveform(
     return enhanced.squeeze(0)  # (T,)
 
 
-def evaluate_metrics(enhanced_dir: str, test_ds: VoiceBankDEMAND, sample_rate: int):
+def evaluate_metrics(enhanced_dir: str, test_ds: VoiceBankDEMAND, sample_rate: int, cfg: FlowCleanConfig):
     """Compute PESQ and STOI on enhanced files using clean refs from HF dataset."""
     try:
         from pesq import pesq
@@ -153,9 +153,15 @@ def evaluate_metrics(enhanced_dir: str, test_ds: VoiceBankDEMAND, sample_rate: i
 
     n = len(pesq_scores)
     if n > 0:
+        avg_pesq = sum(pesq_scores) / n
+        avg_stoi = sum(stoi_scores) / n
         print(f"\nMetrics over {n} files:")
-        print(f"  PESQ:  {sum(pesq_scores)/n:.3f}")
-        print(f"  STOI:  {sum(stoi_scores)/n:.4f}")
+        print(f"  PESQ:  {avg_pesq:.3f}")
+        print(f"  STOI:  {avg_stoi:.4f}")
+
+        if cfg.wandb.use_wandb:
+            import wandb
+            wandb.log({"eval/pesq": avg_pesq, "eval/stoi": avg_stoi})
     else:
         print("No files to evaluate.")
 
@@ -172,6 +178,16 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = FlowCleanConfig.from_yaml(args.config)
+
+    # Wandb (optional)
+    if cfg.wandb.use_wandb:
+        import wandb
+        if cfg.wandb.wandb_token:
+            wandb.login(key=cfg.wandb.wandb_token)
+        wandb.init(
+            project=cfg.wandb.project,
+            job_type="inference",
+        )
 
     # Load checkpoint
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
@@ -217,7 +233,11 @@ def main():
 
     # Evaluate metrics
     if args.eval_metrics:
-        evaluate_metrics(str(output_dir), test_ds, cfg.data.sample_rate)
+        evaluate_metrics(str(output_dir), test_ds, cfg.data.sample_rate, cfg)
+
+    if cfg.wandb.use_wandb:
+        import wandb
+        wandb.finish()
 
 
 if __name__ == "__main__":

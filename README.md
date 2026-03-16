@@ -12,6 +12,9 @@ pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
 
 # Install dependencies
 pip install "datasets<4.0" librosa soundfile pyyaml pesq pystoi
+
+# (Optional) Install wandb for experiment tracking
+pip install wandb
 ```
 
 ## HuggingFace Token
@@ -33,6 +36,18 @@ python train.py --config configs/default.yaml
 ```
 
 Checkpoints are saved to `./checkpoints/`. Edit `configs/default.yaml` to change hyperparameters.
+
+### With Wandb
+
+In `configs/default.yaml`, set:
+
+```yaml
+wandb:
+  use_wandb: true
+  wandb_token: "your_api_key"   # or set WANDB_API_KEY env var
+```
+
+Then run training as usual. Logs `train/loss`, `train/loss_fm`, `train/loss_mr`, `train/lr` per step, and `epoch/avg_loss` per epoch. Inference logs `eval/pesq` and `eval/stoi`.
 
 ## Inference
 

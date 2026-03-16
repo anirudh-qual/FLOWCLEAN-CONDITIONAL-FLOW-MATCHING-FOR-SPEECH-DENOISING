@@ -60,7 +60,8 @@ def train_one_epoch(
     cfg: FlowCleanConfig,
     device: torch.device,
     epoch: int,
-) -> float:
+    global_step: int,
+) -> tuple[float, int]:
     model.train()
     total_loss = 0.0
     n_batches = 0
@@ -113,6 +114,7 @@ def train_one_epoch(
 
         total_loss += loss.item()
         n_batches += 1
+        global_step += 1
 
         if (step + 1) % cfg.training.log_every == 0:
             lr = optimizer.param_groups[0]["lr"]
@@ -121,8 +123,16 @@ def train_one_epoch(
                 f"loss={loss.item():.4f} (fm={loss_fm.item():.4f}, mr={loss_mr.item():.4f}) "
                 f"lr={lr:.2e}"
             )
+            if cfg.wandb.use_wandb:
+                import wandb
+                wandb.log({
+                    "train/loss": loss.item(),
+                    "train/loss_fm": loss_fm.item(),
+                    "train/loss_mr": loss_mr.item(),
+                    "train/lr": lr,
+                }, step=global_step)
 
-    return total_loss / max(n_batches, 1)
+    return total_loss / max(n_batches, 1), global_step
 
 
 def main():
@@ -135,6 +145,22 @@ def main():
     set_seed(cfg.training.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+
+    # Wandb (optional)
+    if cfg.wandb.use_wandb:
+        import wandb
+        if cfg.wandb.wandb_token:
+            wandb.login(key=cfg.wandb.wandb_token)
+        wandb.init(
+            project=cfg.wandb.project,
+            config={
+                "data": cfg.data.__dict__,
+                "stft": cfg.stft.__dict__,
+                "model": cfg.model.__dict__,
+                "loss": {"lambda_mr_stft": cfg.loss.lambda_mr_stft},
+                "training": {k: v for k, v in cfg.training.__dict__.items() if k != "scheduler"},
+            },
+        )
 
     # Dataset (loads from HuggingFace: JacobLinCool/VoiceBank-DEMAND-16k)
     train_ds = VoiceBankDEMAND(
@@ -184,9 +210,10 @@ def main():
 
     # Training loop
     best_loss = float("inf")
+    global_step = 0
     for epoch in range(cfg.training.epochs):
         t0 = time.time()
-        avg_loss = train_one_epoch(
+        avg_loss, global_step = train_one_epoch(
             model=model,
             dataloader=train_loader,
             optimizer=optimizer,
@@ -195,9 +222,14 @@ def main():
             cfg=cfg,
             device=device,
             epoch=epoch,
+            global_step=global_step,
         )
         elapsed = time.time() - t0
         print(f"Epoch {epoch+1}/{cfg.training.epochs} — avg_loss={avg_loss:.4f} — {elapsed:.1f}s")
+
+        if cfg.wandb.use_wandb:
+            import wandb
+            wandb.log({"epoch/avg_loss": avg_loss, "epoch": epoch + 1}, step=global_step)
 
         # Save checkpoint
         if (epoch + 1) % cfg.training.save_every == 0 or avg_loss < best_loss:
@@ -224,6 +256,10 @@ def main():
                     best_path,
                 )
                 print(f"  -> New best model saved (loss={best_loss:.4f})")
+
+    if cfg.wandb.use_wandb:
+        import wandb
+        wandb.finish()
 
     print("Training complete!")
 
