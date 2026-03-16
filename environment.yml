@@ -1,0 +1,16 @@
+name: flowclean
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pytorch>=2.0
+  - torchaudio>=2.0
+  - pytorch-cuda=12.1
+  - pyyaml
+  - pip
+  - pip:
+      - pesq
+      - pystoi
+      - soundfile

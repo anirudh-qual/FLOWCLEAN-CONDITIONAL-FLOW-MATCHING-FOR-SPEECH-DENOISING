@@ -1,0 +1,6 @@
+torch>=2.0
+torchaudio>=2.0
+pyyaml
+pesq
+pystoi
+soundfile
