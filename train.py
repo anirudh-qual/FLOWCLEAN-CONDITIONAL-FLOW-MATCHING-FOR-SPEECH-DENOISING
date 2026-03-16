@@ -1,4 +1,4 @@
-"""FlowClean training script.
+"""FlowClean training script with optional DDP support.
 
   1. Compute complex STFTs of noisy/clean pairs -> 2-channel tensors
   2. Sample Gaussian base noise Z
@@ -8,20 +8,27 @@
   6. Auxiliary multi-resolution STFT loss in waveform space
 
 Usage:
+    # Single GPU
     python train.py --config configs/default.yaml
+
+    # Multi-GPU DDP
+    torchrun --nproc_per_node=NUM_GPUS train.py --config configs/default.yaml
 """
 
 import argparse
 import math
+import os
 import random
 import time
 from pathlib import Path
 
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 import wandb
 
 from flowclean.config import FlowCleanConfig
@@ -31,11 +38,35 @@ from flowclean.losses import MultiResolutionSTFTLoss
 from flowclean.utils.stft import stft, istft
 
 
-def set_seed(seed: int):
-    random.seed(seed)
-    torch.manual_seed(seed)
+# --------------- DDP helpers ---------------
+
+def setup_ddp():
+    """Initialize DDP if launched via torchrun. Returns (rank, world_size, is_ddp)."""
+    if "RANK" in os.environ:
+        dist.init_process_group(backend="nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        torch.cuda.set_device(rank)
+        return rank, world_size, True
+    return 0, 1, False
+
+
+def cleanup_ddp(is_ddp: bool):
+    if is_ddp:
+        dist.destroy_process_group()
+
+
+def is_main(rank: int) -> bool:
+    return rank == 0
+
+
+# --------------- Utilities ---------------
+
+def set_seed(seed: int, rank: int = 0):
+    random.seed(seed + rank)
+    torch.manual_seed(seed + rank)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed_all(seed + rank)
 
 
 def get_scheduler(optimizer, cfg: FlowCleanConfig, steps_per_epoch: int):
@@ -53,6 +84,8 @@ def get_scheduler(optimizer, cfg: FlowCleanConfig, steps_per_epoch: int):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+# --------------- Training ---------------
+
 def train_one_epoch(
     model: nn.Module,
     dataloader: DataLoader,
@@ -63,6 +96,8 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     global_step: int,
+    rank: int = 0,
+    is_ddp: bool = False,
 ) -> tuple[float, int]:
     model.train()
     total_loss = 0.0
@@ -98,8 +133,6 @@ def train_one_epoch(
         loss_mr = torch.tensor(0.0, device=device)
         lam = cfg.loss.lambda_mr_stft
         if lam > 0:
-            # Reconstruct waveforms from predicted spectrograms
-            # Approximate: use z_t + v_pred as one-step estimate of Y_hat
             Y_hat = z_t + (1 - t_expanded) * v_pred
             y_hat = istft(Y_hat, **stft_kwargs, length=clean.shape[-1])
             loss_mr = mr_stft_loss(y_hat, clean)
@@ -118,7 +151,7 @@ def train_one_epoch(
         n_batches += 1
         global_step += 1
 
-        if (step + 1) % cfg.training.log_every == 0:
+        if is_main(rank) and (step + 1) % cfg.training.log_every == 0:
             lr = optimizer.param_groups[0]["lr"]
             print(
                 f"  [Epoch {epoch+1} | Step {step+1}/{len(dataloader)}] "
@@ -133,7 +166,14 @@ def train_one_epoch(
                     "train/lr": lr,
                 }, step=global_step)
 
-    return total_loss / max(n_batches, 1), global_step
+    # Average loss across all ranks for consistent reporting
+    avg_loss = total_loss / max(n_batches, 1)
+    if is_ddp:
+        loss_tensor = torch.tensor(avg_loss, device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+        avg_loss = loss_tensor.item()
+
+    return avg_loss, global_step
 
 
 def main():
@@ -143,12 +183,19 @@ def main():
 
     cfg = FlowCleanConfig.from_yaml(args.config)
 
-    set_seed(cfg.training.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    # DDP setup
+    rank, world_size, is_ddp = setup_ddp()
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
 
-    # Wandb (optional)
-    if cfg.wandb.use_wandb:
+    set_seed(cfg.training.seed, rank)
+
+    if is_main(rank):
+        print(f"Device: {device} | World size: {world_size} | DDP: {is_ddp}")
+
+    # Wandb (optional) — only on rank 0
+    if cfg.wandb.use_wandb and is_main(rank):
+        if cfg.wandb.wandb_token:
+            wandb.login(key=cfg.wandb.wandb_token)
         wandb.init(
             project=cfg.wandb.project,
             config={
@@ -157,6 +204,7 @@ def main():
                 "model": cfg.model.__dict__,
                 "loss": {"lambda_mr_stft": cfg.loss.lambda_mr_stft},
                 "training": {k: v for k, v in cfg.training.__dict__.items() if k != "scheduler"},
+                "world_size": world_size,
             },
         )
 
@@ -166,15 +214,22 @@ def main():
         segment_length=cfg.data.segment_length,
         sample_rate=cfg.data.sample_rate,
     )
+
+    # Use DistributedSampler when running DDP
+    train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True) if is_ddp else None
+
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.training.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
         num_workers=cfg.training.num_workers,
         pin_memory=True,
         drop_last=True,
+        sampler=train_sampler,
     )
-    print(f"Training samples: {len(train_ds)}")
+
+    if is_main(rank):
+        print(f"Training samples: {len(train_ds)}")
 
     # Model
     model = FlowCleanUNet(
@@ -182,8 +237,14 @@ def main():
         num_levels=cfg.model.num_levels,
         time_dim=cfg.model.time_dim,
     ).to(device)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {n_params:,}")
+
+    if is_ddp:
+        model = DDP(model, device_ids=[rank])
+
+    if is_main(rank):
+        raw_model = model.module if is_ddp else model
+        n_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
+        print(f"Model parameters: {n_params:,}")
 
     # Loss
     mr_stft_loss = MultiResolutionSTFTLoss(
@@ -204,12 +265,17 @@ def main():
 
     # Checkpoint directory
     ckpt_dir = Path(cfg.training.checkpoint_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    if is_main(rank):
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # Training loop
     best_loss = float("inf")
     global_step = 0
     for epoch in range(cfg.training.epochs):
+        # Set epoch on sampler so shuffling varies per epoch
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         t0 = time.time()
         avg_loss, global_step = train_one_epoch(
             model=model,
@@ -221,43 +287,55 @@ def main():
             device=device,
             epoch=epoch,
             global_step=global_step,
+            rank=rank,
+            is_ddp=is_ddp,
         )
         elapsed = time.time() - t0
-        print(f"Epoch {epoch+1}/{cfg.training.epochs} — avg_loss={avg_loss:.4f} — {elapsed:.1f}s")
 
-        if cfg.wandb.use_wandb:
-            wandb.log({"epoch/avg_loss": avg_loss, "epoch": epoch + 1}, step=global_step)
+        if is_main(rank):
+            print(f"Epoch {epoch+1}/{cfg.training.epochs} — avg_loss={avg_loss:.4f} — {elapsed:.1f}s")
 
-        # Save checkpoint
-        if (epoch + 1) % cfg.training.save_every == 0 or avg_loss < best_loss:
-            ckpt_path = ckpt_dir / f"flowclean_epoch{epoch+1}.pt"
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "loss": avg_loss,
-                    "config": args.config,
-                },
-                ckpt_path,
-            )
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                best_path = ckpt_dir / "flowclean_best.pt"
+            if cfg.wandb.use_wandb:
+                wandb.log({"epoch/avg_loss": avg_loss, "epoch": epoch + 1}, step=global_step)
+
+            # Save checkpoint (only rank 0)
+            raw_model = model.module if is_ddp else model
+            if (epoch + 1) % cfg.training.save_every == 0 or avg_loss < best_loss:
+                ckpt_path = ckpt_dir / f"flowclean_epoch{epoch+1}.pt"
                 torch.save(
                     {
                         "epoch": epoch + 1,
-                        "model_state_dict": model.state_dict(),
+                        "model_state_dict": raw_model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "loss": avg_loss,
                         "config": args.config,
                     },
-                    best_path,
+                    ckpt_path,
                 )
-                print(f"  -> New best model saved (loss={best_loss:.4f})")
+                if avg_loss < best_loss:
+                    best_loss = avg_loss
+                    best_path = ckpt_dir / "flowclean_best.pt"
+                    torch.save(
+                        {
+                            "epoch": epoch + 1,
+                            "model_state_dict": raw_model.state_dict(),
+                            "config": args.config,
+                        },
+                        best_path,
+                    )
+                    print(f"  -> New best model saved (loss={best_loss:.4f})")
 
-    if cfg.wandb.use_wandb:
+        # Sync all ranks before next epoch
+        if is_ddp:
+            dist.barrier()
+
+    if cfg.wandb.use_wandb and is_main(rank):
         wandb.finish()
 
-    print("Training complete!")
+    cleanup_ddp(is_ddp)
+
+    if is_main(rank):
+        print("Training complete!")
 
 
 if __name__ == "__main__":

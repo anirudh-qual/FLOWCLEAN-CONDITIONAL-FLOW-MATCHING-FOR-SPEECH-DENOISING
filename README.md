@@ -31,11 +31,14 @@ export HF_TOKEN=your_token_here
 ## Train
 
 ```bash
-conda activate flowclean
+# Single GPU
 python train.py --config configs/default.yaml
+
+# Multi-GPU (DDP)
+torchrun --nproc_per_node=4 train.py --config configs/default.yaml
 ```
 
-Checkpoints are saved to `./checkpoints/`. Edit `configs/default.yaml` to change hyperparameters.
+DDP is auto-detected via `torchrun` — no config changes needed. Checkpoints are saved to `./checkpoints/`.
 
 ### With Wandb
 
