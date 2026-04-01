@@ -26,6 +26,7 @@ The dataset is loaded from HuggingFace (`JacobLinCool/VoiceBank-DEMAND-16k`). If
 huggingface-cli login
 # OR set the env var
 export HF_TOKEN=your_token_here
+export WANDB_API_KEY= your_token_here
 ```
 
 ## Train
@@ -35,7 +36,7 @@ export HF_TOKEN=your_token_here
 python train.py --config configs/default.yaml
 
 # Multi-GPU (DDP)
-torchrun --nproc_per_node=4 train.py --config configs/default.yaml
+torchrun --nproc_per_node=3 train.py --config configs/default.yaml
 ```
 
 DDP is auto-detected via `torchrun` — no config changes needed. Checkpoints are saved to `./checkpoints/`.
