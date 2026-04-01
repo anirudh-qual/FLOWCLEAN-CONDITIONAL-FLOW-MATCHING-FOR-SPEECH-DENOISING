@@ -19,6 +19,9 @@ from pathlib import Path
 import torch
 import torchaudio
 import wandb
+import numpy as np
+from pesq import pesq
+from pystoi import stoi
 
 from flowclean.config import FlowCleanConfig
 from flowclean.models import FlowCleanUNet
@@ -120,19 +123,24 @@ def enhance_waveform(
     return enhanced.squeeze(0)  # (T,)
 
 
-def evaluate_metrics(enhanced_dir: str, test_ds: VoiceBankDEMAND, sample_rate: int, cfg: FlowCleanConfig):
-    """Compute PESQ and STOI on enhanced files using clean refs from HF dataset."""
-    try:
-        from pesq import pesq
-        from pystoi import stoi
-    except ImportError:
-        print("Install pesq and pystoi for metrics: pip install pesq pystoi")
-        return
+def si_sdr(reference, estimated) -> float:
+    """Scale-Invariant Signal-to-Distortion Ratio (SI-SDR) in dB."""
+    reference = reference - reference.mean()
+    estimated = estimated - estimated.mean()
+    alpha = (reference @ estimated) / (reference @ reference + 1e-8)
+    projection = alpha * reference
+    noise = estimated - projection
+    return 10 * np.log10((projection @ projection + 1e-8) / (noise @ noise + 1e-8))
 
+
+def evaluate_metrics(enhanced_dir: str, test_ds: VoiceBankDEMAND, sample_rate: int, cfg: FlowCleanConfig):
+    """Compute PESQ, STOI, ESTOI, and SI-SDR on enhanced files using clean refs from HF dataset."""
+    
     enhanced_dir = Path(enhanced_dir)
 
     pesq_scores = []
-    stoi_scores = []
+    estoi_scores = []
+    sisdr_scores = []
 
     for i in range(len(test_ds)):
         fname = test_ds.filenames[i]
@@ -150,18 +158,25 @@ def evaluate_metrics(enhanced_dir: str, test_ds: VoiceBankDEMAND, sample_rate: i
         cln = cln[:min_len]
 
         pesq_scores.append(pesq(sample_rate, cln, enh, "wb"))
-        stoi_scores.append(stoi(cln, enh, sample_rate, extended=False))
+        estoi_scores.append(stoi(cln, enh, sample_rate, extended=True))
+        sisdr_scores.append(si_sdr(cln, enh))
 
     n = len(pesq_scores)
     if n > 0:
         avg_pesq = sum(pesq_scores) / n
-        avg_stoi = sum(stoi_scores) / n
+        avg_estoi = sum(estoi_scores) / n
+        avg_sisdr = sum(sisdr_scores) / n
         print(f"\nMetrics over {n} files:")
-        print(f"  PESQ:  {avg_pesq:.3f}")
-        print(f"  STOI:  {avg_stoi:.4f}")
+        print(f"  PESQ:   {avg_pesq:.3f}")
+        print(f"  ESTOI:  {avg_estoi:.4f}")
+        print(f"  SI-SDR: {avg_sisdr:.2f} dB")
 
         if cfg.wandb.use_wandb:
-            wandb.log({"eval/pesq": avg_pesq, "eval/stoi": avg_stoi})
+            wandb.log({
+                "eval/pesq": avg_pesq,
+                "eval/estoi": avg_estoi,
+                "eval/si_sdr": avg_sisdr,
+            })
     else:
         print("No files to evaluate.")
 
