@@ -27,12 +27,12 @@ loss:
 
 # --------------- Training ---------------
 training:
-  epochs: 200
-  batch_size: 8
+  epochs: 100
+  batch_size: 32
   lr: 2.0e-4
   weight_decay: 1.0e-6
   grad_clip: 1.0
-  num_workers: 4
+  num_workers: 0
   seed: 42
 
   # Learning rate scheduler (cosine annealing)
@@ -54,5 +54,5 @@ inference:
 # --------------- Wandb (optional) ---------------
 wandb:
   use_wandb: false
-  project: "flowclean"
+  project: "Flowclean"
   
