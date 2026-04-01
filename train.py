@@ -195,7 +195,7 @@ def main():
     # Wandb (optional) — only on rank 0
     if cfg.wandb.use_wandb and is_main(rank):
         if cfg.wandb.wandb_token:
-            wandb.login(key=cfg.wandb.wandb_token)
+            wandb.login()
         wandb.init(
             project=cfg.wandb.project,
             config={
