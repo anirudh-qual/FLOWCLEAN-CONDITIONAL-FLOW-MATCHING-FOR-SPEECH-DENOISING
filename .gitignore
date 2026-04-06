@@ -2,3 +2,5 @@
 checkpoints/
 __pycache__
 .gitignore
+wandb
+.env

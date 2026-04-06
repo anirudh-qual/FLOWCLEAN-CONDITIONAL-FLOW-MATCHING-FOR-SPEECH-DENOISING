@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+from contextlib import nullcontext
 import math
 import os
 import random
@@ -103,6 +104,9 @@ def train_one_epoch(
     total_loss = 0.0
     n_batches = 0
     stft_kwargs = cfg.stft.to_dict()
+    grad_accum_steps = max(1, cfg.training.grad_accum_steps)
+
+    optimizer.zero_grad(set_to_none=True)
 
     for step, batch in enumerate(dataloader):
         clean = batch["clean"].to(device)   # (B, T)
@@ -138,14 +142,22 @@ def train_one_epoch(
             loss_mr = mr_stft_loss(y_hat, clean)
 
         loss = loss_fm + lam * loss_mr
+        loss_for_backward = loss / grad_accum_steps
 
-        optimizer.zero_grad()
-        loss.backward()
-        if cfg.training.grad_clip > 0:
-            nn.utils.clip_grad_norm_(model.parameters(), cfg.training.grad_clip)
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
+        should_step = ((step + 1) % grad_accum_steps == 0) or ((step + 1) == len(dataloader))
+        sync_context = (
+            model.no_sync if (is_ddp and isinstance(model, DDP) and not should_step) else nullcontext
+        )
+        with sync_context():
+            loss_for_backward.backward()
+
+        if should_step:
+            if cfg.training.grad_clip > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), cfg.training.grad_clip)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            if scheduler is not None:
+                scheduler.step()
 
         total_loss += loss.item()
         n_batches += 1

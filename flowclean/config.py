@@ -46,6 +46,7 @@ class SchedulerConfig:
 class TrainingConfig:
     epochs: int = 200
     batch_size: int = 8
+    grad_accum_steps: int = 1
     lr: float = 2e-4
     weight_decay: float = 1e-6
     grad_clip: float = 1.0

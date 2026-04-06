@@ -10,7 +10,8 @@ Usage:
     python inference.py --checkpoint checkpoints/flowclean_best.pt \
                         --output_dir ./enhanced \
                         --ode_steps 10 \
-                        --solver euler
+                        --solver euler \
+                        --eval_metrics
 """
 
 import argparse
@@ -201,18 +202,18 @@ def main():
             job_type="inference",
         )
 
-    # Load checkpoint
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    # # Load checkpoint
+    # ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
 
-    # Build model
-    model = FlowCleanUNet(
-        base_channels=cfg.model.base_channels,
-        num_levels=cfg.model.num_levels,
-        time_dim=cfg.model.time_dim,
-    ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-    print(f"Loaded checkpoint from epoch {ckpt.get('epoch', '?')}")
+    # # Build model
+    # model = FlowCleanUNet(
+    #     base_channels=cfg.model.base_channels,
+    #     num_levels=cfg.model.num_levels,
+    #     time_dim=cfg.model.time_dim,
+    # ).to(device)
+    # model.load_state_dict(ckpt["model_state_dict"])
+    # model.eval()
+    # print(f"Loaded checkpoint from epoch {ckpt.get('epoch', '?')}")
 
     # Load test set (from HuggingFace: JacobLinCool/VoiceBank-DEMAND-16k)
     test_ds = VoiceBankDEMAND(
@@ -224,24 +225,24 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Enhancing {len(test_ds)} utterances with K={args.ode_steps} ({args.solver})...")
-    for i in range(len(test_ds)):
-        sample = test_ds[i]
-        noisy = sample["noisy"]
-        enhanced = enhance_waveform(
-            model, noisy, cfg,
-            K=args.ode_steps,
-            solver=args.solver,
-            device=device,
-        )
-        fname = test_ds.filenames[i]
-        out_path = output_dir / fname
-        torchaudio.save(str(out_path), enhanced.unsqueeze(0).cpu(), cfg.data.sample_rate)
+    # print(f"Enhancing {len(test_ds)} utterances with K={args.ode_steps} ({args.solver})...")
+    # for i in range(len(test_ds)):
+    #     sample = test_ds[i]
+    #     noisy = sample["noisy"]
+    #     enhanced = enhance_waveform(
+    #         model, noisy, cfg,
+    #         K=args.ode_steps,
+    #         solver=args.solver,
+    #         device=device,
+    #     )
+    #     fname = test_ds.filenames[i]
+    #     out_path = output_dir / fname
+    #     torchaudio.save(str(out_path), enhanced.unsqueeze(0).cpu(), cfg.data.sample_rate)
 
-        if (i + 1) % 50 == 0:
-            print(f"  Processed {i+1}/{len(test_ds)}")
+    #     if (i + 1) % 50 == 0:
+    #         print(f"  Processed {i+1}/{len(test_ds)}")
 
-    print(f"Enhanced files saved to {output_dir}")
+    # print(f"Enhanced files saved to {output_dir}")
 
     # Evaluate metrics
     if args.eval_metrics:
