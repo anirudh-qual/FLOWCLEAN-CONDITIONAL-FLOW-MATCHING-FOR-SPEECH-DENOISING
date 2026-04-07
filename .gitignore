@@ -1,6 +1,6 @@
 .env
-checkpoints/
-__pycache__
+.env.env
 .gitignore
+__pycache__
+checkpoints/
 wandb
-.env
