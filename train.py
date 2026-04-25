@@ -28,7 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from torch.utils.data.distributed import DistributedSampler
 import wandb
 
@@ -37,6 +37,7 @@ from flowclean.models import FlowCleanUNet
 from flowclean.data import VoiceBankDEMAND
 from flowclean.losses import MultiResolutionSTFTLoss
 from flowclean.utils.stft import stft, istft
+from flowclean.utils.ema import EMA
 
 
 # --------------- DDP helpers ---------------
@@ -85,6 +86,89 @@ def get_scheduler(optimizer, cfg: FlowCleanConfig, steps_per_epoch: int):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+# --------------- Validation ---------------
+
+@torch.no_grad()
+def validate(
+    model: nn.Module,
+    val_loader: DataLoader,
+    mr_stft_loss: MultiResolutionSTFTLoss,
+    cfg: FlowCleanConfig,
+    device: torch.device,
+    is_ddp: bool = False,
+    ema: EMA | None = None,
+) -> tuple[float, float, float]:
+    """One pass over the validation split.
+
+    Uses EMA weights when available (matches the inference setup).
+    Returns (avg_total, avg_fm, avg_mr) all-reduced across ranks.
+    """
+    raw_model = model.module if isinstance(model, DDP) else model
+
+    if ema is not None:
+        ema.apply_to(raw_model)
+
+    raw_model.eval()
+    stft_kwargs = cfg.stft.to_dict()
+    compress_kwargs = cfg.stft.compress_kwargs()
+    stft_full_kwargs = {**stft_kwargs, **compress_kwargs}
+    lam = cfg.loss.lambda_mr_stft
+
+    sum_total = 0.0
+    sum_fm = 0.0
+    sum_mr = 0.0
+    n_batches = 0
+
+    try:
+        for batch in val_loader:
+            clean = batch["clean"].to(device)
+            noisy = batch["noisy"].to(device)
+            B = clean.shape[0]
+
+            Y = stft(clean, **stft_full_kwargs)
+            X = stft(noisy, **stft_full_kwargs)
+            Z = torch.randn_like(Y)
+            t = torch.rand(B, device=device)
+            t_expanded = t[:, None, None, None]
+            z_t = (1 - t_expanded) * Z + t_expanded * Y
+
+            v_pred = raw_model(z_t, t, X)
+            loss_fm = F.mse_loss(v_pred, Y - Z)
+
+            loss_mr = torch.tensor(0.0, device=device)
+            if lam > 0:
+                Y_hat = z_t + (1 - t_expanded) * v_pred
+                y_hat = istft(Y_hat, **stft_full_kwargs, length=clean.shape[-1])
+                loss_mr = mr_stft_loss(y_hat, clean)
+
+            loss = loss_fm + lam * loss_mr
+            sum_total += loss.item()
+            sum_fm += loss_fm.item()
+            sum_mr += loss_mr.item()
+            n_batches += 1
+    finally:
+        if ema is not None:
+            ema.restore(raw_model)
+        raw_model.train()
+
+    avg_total = sum_total / max(n_batches, 1)
+    avg_fm = sum_fm / max(n_batches, 1)
+    avg_mr = sum_mr / max(n_batches, 1)
+
+    if is_ddp:
+        avg_total_t = torch.tensor(avg_total, device=device)
+        avg_fm_t = torch.tensor(avg_fm, device=device)
+        avg_mr_t = torch.tensor(avg_mr, device=device)
+        dist.all_reduce(avg_total_t, op=dist.ReduceOp.AVG)
+        dist.all_reduce(avg_fm_t, op=dist.ReduceOp.AVG)
+        dist.all_reduce(avg_mr_t, op=dist.ReduceOp.AVG)
+        avg_total = avg_total_t.item()
+        avg_fm = avg_fm_t.item()
+        avg_mr = avg_mr_t.item()
+
+    return avg_total, avg_fm, avg_mr
+
+
 # --------------- Training ---------------
 
 def train_one_epoch(
@@ -99,11 +183,14 @@ def train_one_epoch(
     global_step: int,
     rank: int = 0,
     is_ddp: bool = False,
+    ema: EMA | None = None,
 ) -> tuple[float, int]:
     model.train()
     total_loss = 0.0
     n_batches = 0
     stft_kwargs = cfg.stft.to_dict()
+    compress_kwargs = cfg.stft.compress_kwargs()
+    stft_full_kwargs = {**stft_kwargs, **compress_kwargs}
     grad_accum_steps = max(1, cfg.training.grad_accum_steps)
 
     optimizer.zero_grad(set_to_none=True)
@@ -113,9 +200,9 @@ def train_one_epoch(
         noisy = batch["noisy"].to(device)   # (B, T)
         B = clean.shape[0]
 
-        # Step 1: Compute complex STFTs -> (B, 2, F, T')
-        Y = stft(clean, **stft_kwargs)
-        X = stft(noisy, **stft_kwargs)
+        # Step 1: Compute complex STFTs -> (B, 2, F, T') with power-law compression
+        Y = stft(clean, **stft_full_kwargs)
+        X = stft(noisy, **stft_full_kwargs)
 
         # Step 2: Sample base noise Z ~ N(0, I)
         Z = torch.randn_like(Y)
@@ -138,7 +225,7 @@ def train_one_epoch(
         lam = cfg.loss.lambda_mr_stft
         if lam > 0:
             Y_hat = z_t + (1 - t_expanded) * v_pred
-            y_hat = istft(Y_hat, **stft_kwargs, length=clean.shape[-1])
+            y_hat = istft(Y_hat, **stft_full_kwargs, length=clean.shape[-1])
             loss_mr = mr_stft_loss(y_hat, clean)
 
         loss = loss_fm + lam * loss_mr
@@ -158,6 +245,8 @@ def train_one_epoch(
             optimizer.zero_grad(set_to_none=True)
             if scheduler is not None:
                 scheduler.step()
+            if ema is not None:
+                ema.update(model.module if isinstance(model, DDP) else model)
 
         total_loss += loss.item()
         n_batches += 1
@@ -221,11 +310,24 @@ def main():
         )
 
     # Dataset (loads from HuggingFace: JacobLinCool/VoiceBank-DEMAND-16k)
-    train_ds = VoiceBankDEMAND(
+    full_train_ds = VoiceBankDEMAND(
         split="train",
         segment_length=cfg.data.segment_length,
         sample_rate=cfg.data.sample_rate,
     )
+
+    # Carve a deterministic held-out validation slice from the train split.
+    # Same generator seed on every rank => same split on every rank.
+    val_fraction = cfg.training.val_fraction
+    if val_fraction > 0:
+        n_total = len(full_train_ds)
+        n_val = max(1, int(round(n_total * val_fraction)))
+        n_train = n_total - n_val
+        gen = torch.Generator().manual_seed(cfg.training.val_split_seed)
+        train_ds, val_ds = random_split(full_train_ds, [n_train, n_val], generator=gen)
+    else:
+        train_ds = full_train_ds
+        val_ds = None
 
     # Use DistributedSampler when running DDP
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True) if is_ddp else None
@@ -240,8 +342,24 @@ def main():
         sampler=train_sampler,
     )
 
+    val_loader = None
+    if val_ds is not None:
+        val_sampler = (
+            DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False)
+            if is_ddp else None
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=cfg.training.batch_size,
+            shuffle=False,
+            num_workers=cfg.training.num_workers,
+            pin_memory=True,
+            drop_last=False,
+            sampler=val_sampler,
+        )
+
     if is_main(rank):
-        print(f"Training samples: {len(train_ds)}")
+        print(f"Training samples: {len(train_ds)}" + (f" | Val samples: {len(val_ds)}" if val_ds is not None else ""))
 
     # Model
     model = FlowCleanUNet(
@@ -275,13 +393,21 @@ def main():
     # Scheduler
     scheduler = get_scheduler(optimizer, cfg, len(train_loader))
 
+    # EMA (built off the unwrapped model so DDP buckets don't matter)
+    ema = None
+    if cfg.training.use_ema:
+        raw_model = model.module if is_ddp else model
+        ema = EMA(raw_model, decay=cfg.training.ema_decay)
+        if is_main(rank):
+            print(f"EMA enabled with decay={cfg.training.ema_decay}")
+
     # Checkpoint directory
     ckpt_dir = Path(cfg.training.checkpoint_dir)
     if is_main(rank):
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # Training loop
-    best_loss = float("inf")
+    best_metric = float("inf")  # tracked metric: val loss if available, else train loss
     global_step = 0
     for epoch in range(cfg.training.epochs):
         # Set epoch on sampler so shuffling varies per epoch
@@ -301,41 +427,80 @@ def main():
             global_step=global_step,
             rank=rank,
             is_ddp=is_ddp,
+            ema=ema,
         )
-        elapsed = time.time() - t0
+        elapsed_train = time.time() - t0
+
+        # Validation pass (every rank participates so DDP all-reduce works)
+        val_total = val_fm = val_mr = float("nan")
+        if val_loader is not None:
+            t_val = time.time()
+            val_total, val_fm, val_mr = validate(
+                model=model,
+                val_loader=val_loader,
+                mr_stft_loss=mr_stft_loss,
+                cfg=cfg,
+                device=device,
+                is_ddp=is_ddp,
+                ema=ema,
+            )
+            elapsed_val = time.time() - t_val
+        else:
+            elapsed_val = 0.0
+
+        # Selection metric: val loss when we have it, else fall back to train loss
+        selection_metric = val_total if val_loader is not None else avg_loss
 
         if is_main(rank):
-            print(f"Epoch {epoch+1}/{cfg.training.epochs} — avg_loss={avg_loss:.4f} — {elapsed:.1f}s")
+            val_str = (
+                f" | val_loss={val_total:.4f} (fm={val_fm:.4f}, mr={val_mr:.4f}) [{elapsed_val:.1f}s]"
+                if val_loader is not None else ""
+            )
+            print(
+                f"Epoch {epoch+1}/{cfg.training.epochs} — train_loss={avg_loss:.4f}"
+                f"{val_str} — train {elapsed_train:.1f}s"
+            )
 
             if cfg.wandb.use_wandb:
-                wandb.log({"epoch/avg_loss": avg_loss, "epoch": epoch + 1}, step=global_step)
+                log_payload = {"epoch/train_loss": avg_loss, "epoch": epoch + 1}
+                if val_loader is not None:
+                    log_payload.update({
+                        "epoch/val_loss": val_total,
+                        "epoch/val_loss_fm": val_fm,
+                        "epoch/val_loss_mr": val_mr,
+                    })
+                wandb.log(log_payload, step=global_step)
 
             # Save checkpoint (only rank 0)
             raw_model = model.module if is_ddp else model
-            if (epoch + 1) % cfg.training.save_every == 0 or avg_loss < best_loss:
+            if (epoch + 1) % cfg.training.save_every == 0 or selection_metric < best_metric:
                 ckpt_path = ckpt_dir / f"flowclean_epoch{epoch+1}.pt"
-                torch.save(
-                    {
+                ckpt_payload = {
+                    "epoch": epoch + 1,
+                    "model_state_dict": raw_model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "train_loss": avg_loss,
+                    "val_loss": val_total if val_loader is not None else None,
+                    "config": args.config,
+                }
+                if ema is not None:
+                    ckpt_payload["ema_state_dict"] = ema.state_dict()
+                torch.save(ckpt_payload, ckpt_path)
+                if selection_metric < best_metric:
+                    best_metric = selection_metric
+                    best_path = ckpt_dir / "flowclean_best.pt"
+                    best_payload = {
                         "epoch": epoch + 1,
                         "model_state_dict": raw_model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "loss": avg_loss,
+                        "train_loss": avg_loss,
+                        "val_loss": val_total if val_loader is not None else None,
                         "config": args.config,
-                    },
-                    ckpt_path,
-                )
-                if avg_loss < best_loss:
-                    best_loss = avg_loss
-                    best_path = ckpt_dir / "flowclean_best.pt"
-                    torch.save(
-                        {
-                            "epoch": epoch + 1,
-                            "model_state_dict": raw_model.state_dict(),
-                            "config": args.config,
-                        },
-                        best_path,
-                    )
-                    print(f"  -> New best model saved (loss={best_loss:.4f})")
+                    }
+                    if ema is not None:
+                        best_payload["ema_state_dict"] = ema.state_dict()
+                    torch.save(best_payload, best_path)
+                    metric_name = "val_loss" if val_loader is not None else "train_loss"
+                    print(f"  -> New best model saved ({metric_name}={best_metric:.4f})")
 
         # Sync all ranks before next epoch
         if is_ddp:

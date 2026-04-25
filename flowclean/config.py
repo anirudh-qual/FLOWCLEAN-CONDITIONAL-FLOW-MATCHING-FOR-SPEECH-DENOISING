@@ -10,9 +10,14 @@ class STFTConfig:
     n_fft: int = 510
     hop_length: int = 128
     win_length: int = 510
+    compress_alpha: float = 0.5
+    compress_beta: float = 0.15
 
     def to_dict(self) -> dict:
         return {"n_fft": self.n_fft, "hop_length": self.hop_length, "win_length": self.win_length}
+
+    def compress_kwargs(self) -> dict:
+        return {"alpha": self.compress_alpha, "beta": self.compress_beta}
 
 
 @dataclass
@@ -47,7 +52,7 @@ class TrainingConfig:
     epochs: int = 200
     batch_size: int = 8
     grad_accum_steps: int = 1
-    lr: float = 2e-4
+    lr: float = 1e-4
     weight_decay: float = 1e-6
     grad_clip: float = 1.0
     num_workers: int = 4
@@ -56,6 +61,10 @@ class TrainingConfig:
     save_every: int = 10
     log_every: int = 100
     checkpoint_dir: str = "./checkpoints"
+    use_ema: bool = True
+    ema_decay: float = 0.999
+    val_fraction: float = 0.05
+    val_split_seed: int = 1234
 
 
 @dataclass

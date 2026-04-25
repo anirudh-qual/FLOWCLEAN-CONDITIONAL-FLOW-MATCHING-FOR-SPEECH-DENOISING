@@ -1,4 +1,9 @@
-# FlowClean training configuration
+# FlowClean training configuration (Phase 0 baseline)
+# Phase 0 changes vs original:
+#   - lr 2e-4 -> 1e-4 (matches SGMSE+ / StoRM / FlowSE / MeanFlowSE)
+#   - epochs 100 -> 200
+#   - SGMSE+-style power-law compression on the complex STFT (alpha=0.5, beta=0.15)
+#   - EMA on model weights (decay=0.999); inference loads EMA by default
 
 # --------------- Data ---------------
 data:
@@ -10,6 +15,8 @@ stft:
   n_fft: 510
   hop_length: 128
   win_length: 510
+  compress_alpha: 0.5                   # |z|^alpha
+  compress_beta: 0.15                   # scale factor
 
 # --------------- Model ---------------
 model:
@@ -19,7 +26,7 @@ model:
 
 # --------------- Loss ---------------
 loss:
-  lambda_mr_stft: 0.1                  # weight for multi-resolution STFT loss
+  lambda_mr_stft: 0.1                   # weight for multi-resolution STFT loss
   mr_stft:
     fft_sizes: [512, 1024, 2048]
     hop_sizes: [120, 240, 480]
@@ -27,24 +34,25 @@ loss:
 
 # --------------- Training ---------------
 training:
-  epochs: 100
+  epochs: 200
   batch_size: 32
-  lr: 2.0e-4
+  lr: 1.0e-4
   weight_decay: 1.0e-6
   grad_clip: 1.0
   num_workers: 0
   seed: 42
 
-  # Learning rate scheduler (cosine annealing)
+  use_ema: true
+  ema_decay: 0.999
+
   scheduler:
     type: "cosine"
     warmup_epochs: 5
     min_lr: 1.0e-6
 
-  # Checkpointing
-  save_every: 10                        # save checkpoint every N epochs
-  log_every: 100                        # log every N steps
-  checkpoint_dir: "./checkpoints"
+  save_every: 10
+  log_every: 100
+  checkpoint_dir: "./checkpoints/phase0_baseline"
 
 # --------------- Inference ---------------
 inference:
@@ -53,6 +61,5 @@ inference:
 
 # --------------- Wandb (optional) ---------------
 wandb:
-  use_wandb: false
+  use_wandb: true
   project: "Flowclean"
-  

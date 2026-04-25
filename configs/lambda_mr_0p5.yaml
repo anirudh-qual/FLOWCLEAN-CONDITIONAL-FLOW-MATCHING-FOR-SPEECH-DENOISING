@@ -1,0 +1,50 @@
+# Phase 2 sweep: lambda_mr_stft = 0.5
+
+data:
+  sample_rate: 16000
+  segment_length: 32000
+
+stft:
+  n_fft: 510
+  hop_length: 128
+  win_length: 510
+  compress_alpha: 0.5
+  compress_beta: 0.15
+
+model:
+  base_channels: 64
+  num_levels: 4
+  time_dim: 256
+
+loss:
+  lambda_mr_stft: 0.5
+  mr_stft:
+    fft_sizes: [512, 1024, 2048]
+    hop_sizes: [120, 240, 480]
+    win_sizes: [512, 1024, 2048]
+
+training:
+  epochs: 200
+  batch_size: 32
+  lr: 1.0e-4
+  weight_decay: 1.0e-6
+  grad_clip: 1.0
+  num_workers: 0
+  seed: 42
+  use_ema: true
+  ema_decay: 0.999
+  scheduler:
+    type: "cosine"
+    warmup_epochs: 5
+    min_lr: 1.0e-6
+  save_every: 10
+  log_every: 100
+  checkpoint_dir: "./checkpoints/lambda_mr_0p5"
+
+inference:
+  ode_steps: 10
+  solver: "euler"
+
+wandb:
+  use_wandb: false
+  project: "Flowclean"

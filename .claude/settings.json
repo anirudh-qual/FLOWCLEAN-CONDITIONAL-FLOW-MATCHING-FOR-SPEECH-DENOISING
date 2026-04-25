@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3)",
+      "Bash(chmod +x /coc/scratch/vvobbilisetty6/flow_clean/FLOWCLEAN-CONDITIONAL-FLOW-MATCHING-FOR-SPEECH-DENOISING/scripts/sweep_solver_nfe.sh)",
+      "Bash(chmod +x /coc/scratch/vvobbilisetty6/flow_clean/FLOWCLEAN-CONDITIONAL-FLOW-MATCHING-FOR-SPEECH-DENOISING/slurm/*.sh)",
+      "Bash(python -c ' *)"
+    ]
+  }
+}

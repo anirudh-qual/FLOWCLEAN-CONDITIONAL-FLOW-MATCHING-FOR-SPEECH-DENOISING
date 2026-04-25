@@ -108,9 +108,11 @@ def enhance_waveform(
     orig_len = noisy_wav.shape[-1]
     noisy_wav = noisy_wav.unsqueeze(0).to(device)  # (1, T)
     stft_kwargs = cfg.stft.to_dict()
+    compress_kwargs = cfg.stft.compress_kwargs()
+    stft_full_kwargs = {**stft_kwargs, **compress_kwargs}
 
-    # Step 1: Compute noisy spectrogram
-    X = stft(noisy_wav, **stft_kwargs)  # (1, 2, F, T')
+    # Step 1: Compute noisy spectrogram (compressed)
+    X = stft(noisy_wav, **stft_full_kwargs)
 
     # Step 2: Initialize from Gaussian
     z0 = torch.randn_like(X)
@@ -119,8 +121,8 @@ def enhance_waveform(
     solve_fn = euler_solve if solver == "euler" else heun_solve
     Y_hat = solve_fn(model, X, z0, K)
 
-    # Step 4: Inverse STFT
-    enhanced = istft(Y_hat, **stft_kwargs, length=orig_len)
+    # Step 4: Inverse STFT (decompresses internally)
+    enhanced = istft(Y_hat, **stft_full_kwargs, length=orig_len)
     return enhanced.squeeze(0)  # (T,)
 
 
@@ -134,7 +136,14 @@ def si_sdr(reference, estimated) -> float:
     return 10 * np.log10((projection @ projection + 1e-8) / (noise @ noise + 1e-8))
 
 
-def evaluate_metrics(enhanced_dir: str, test_ds: VoiceBankDEMAND, sample_rate: int, cfg: FlowCleanConfig):
+def evaluate_metrics(
+    enhanced_dir: str,
+    test_ds: VoiceBankDEMAND,
+    sample_rate: int,
+    cfg: FlowCleanConfig,
+    ode_steps: int | None = None,
+    solver: str | None = None,
+):
     """Compute PESQ, STOI, ESTOI, and SI-SDR on enhanced files using clean refs from HF dataset."""
     
     enhanced_dir = Path(enhanced_dir)
@@ -173,11 +182,16 @@ def evaluate_metrics(enhanced_dir: str, test_ds: VoiceBankDEMAND, sample_rate: i
         print(f"  SI-SDR: {avg_sisdr:.2f} dB")
 
         if cfg.wandb.use_wandb:
-            wandb.log({
+            log_payload = {
                 "eval/pesq": avg_pesq,
                 "eval/estoi": avg_estoi,
                 "eval/si_sdr": avg_sisdr,
-            })
+            }
+            if ode_steps is not None:
+                log_payload["eval/ode_steps"] = ode_steps
+            if solver is not None:
+                log_payload["eval/solver"] = solver
+            wandb.log(log_payload)
     else:
         print("No files to evaluate.")
 
@@ -190,6 +204,11 @@ def main():
     parser.add_argument("--ode_steps", type=int, default=10, help="Number of ODE steps K")
     parser.add_argument("--solver", type=str, default="euler", choices=["euler", "heun"])
     parser.add_argument("--eval_metrics", action="store_true", help="Compute PESQ/STOI")
+    parser.add_argument(
+        "--no_ema",
+        action="store_true",
+        help="Disable loading EMA weights even if present in the checkpoint",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -200,20 +219,43 @@ def main():
         wandb.init(
             project=cfg.wandb.project,
             job_type="inference",
+            config={
+                "ode_steps": args.ode_steps,
+                "solver": args.solver,
+                "checkpoint": args.checkpoint,
+                "use_ema": not args.no_ema,
+            },
         )
 
-    # # Load checkpoint
-    # ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    # Load checkpoint
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
 
-    # # Build model
-    # model = FlowCleanUNet(
-    #     base_channels=cfg.model.base_channels,
-    #     num_levels=cfg.model.num_levels,
-    #     time_dim=cfg.model.time_dim,
-    # ).to(device)
-    # model.load_state_dict(ckpt["model_state_dict"])
-    # model.eval()
-    # print(f"Loaded checkpoint from epoch {ckpt.get('epoch', '?')}")
+    # Build model
+    model = FlowCleanUNet(
+        base_channels=cfg.model.base_channels,
+        num_levels=cfg.model.num_levels,
+        time_dim=cfg.model.time_dim,
+    ).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+
+    # Prefer EMA weights when available (decoupled from raw weights)
+    use_ema = (not args.no_ema) and ("ema_state_dict" in ckpt)
+    if use_ema:
+        ema_shadow = ckpt["ema_state_dict"]["shadow"]
+        loaded = 0
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name in ema_shadow:
+                    param.copy_(ema_shadow[name].to(device))
+                    loaded += 1
+        print(f"Loaded EMA weights ({loaded} parameters) from checkpoint")
+    elif args.no_ema:
+        print("EMA loading disabled by --no_ema flag")
+    elif "ema_state_dict" not in ckpt:
+        print("No EMA weights found in checkpoint, using raw weights")
+
+    model.eval()
+    print(f"Loaded checkpoint from epoch {ckpt.get('epoch', '?')}")
 
     # Load test set (from HuggingFace: JacobLinCool/VoiceBank-DEMAND-16k)
     test_ds = VoiceBankDEMAND(
@@ -226,27 +268,34 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # print(f"Enhancing {len(test_ds)} utterances with K={args.ode_steps} ({args.solver})...")
-    # for i in range(len(test_ds)):
-    #     sample = test_ds[i]
-    #     noisy = sample["noisy"]
-    #     enhanced = enhance_waveform(
-    #         model, noisy, cfg,
-    #         K=args.ode_steps,
-    #         solver=args.solver,
-    #         device=device,
-    #     )
-    #     fname = test_ds.filenames[i]
-    #     out_path = output_dir / fname
-    #     torchaudio.save(str(out_path), enhanced.unsqueeze(0).cpu(), cfg.data.sample_rate)
+    for i in range(len(test_ds)):
+        sample = test_ds[i]
+        noisy = sample["noisy"]
+        enhanced = enhance_waveform(
+            model, noisy, cfg,
+            K=args.ode_steps,
+            solver=args.solver,
+            device=device,
+        )
+        fname = test_ds.filenames[i]
+        out_path = output_dir / fname
+        torchaudio.save(str(out_path), enhanced.unsqueeze(0).cpu(), cfg.data.sample_rate)
 
-    #     if (i + 1) % 50 == 0:
-    #         print(f"  Processed {i+1}/{len(test_ds)}")
+        if (i + 1) % 50 == 0:
+            print(f"  Processed {i+1}/{len(test_ds)}")
 
-    # print(f"Enhanced files saved to {output_dir}")
+    print(f"Enhanced files saved to {output_dir}")
 
     # Evaluate metrics
     if args.eval_metrics:
-        evaluate_metrics(str(output_dir), test_ds, cfg.data.sample_rate, cfg)
+        evaluate_metrics(
+            str(output_dir),
+            test_ds,
+            cfg.data.sample_rate,
+            cfg,
+            ode_steps=args.ode_steps,
+            solver=args.solver,
+        )
 
     if cfg.wandb.use_wandb:
         wandb.finish()
